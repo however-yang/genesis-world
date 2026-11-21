@@ -58,6 +58,7 @@ GL_RGB = load_const("GL_RGB")
 GL_DEPTH_COMPONENT = load_const("GL_DEPTH_COMPONENT")
 GL_UNSIGNED_BYTE = load_const("GL_UNSIGNED_BYTE")
 GL_FLOAT = load_const("GL_FLOAT")
+GL_HALF_FLOAT = load_const("GL_HALF_FLOAT")
 GL_ARRAY_BUFFER = load_const("GL_ARRAY_BUFFER")
 GL_STREAM_DRAW = load_const("GL_STREAM_DRAW")
 
@@ -235,6 +236,7 @@ class JITRenderer:
         self._point_shadow_mapping_pass = None
         self._read_depth_buf = None
         self._read_color_buf = None
+        self._read_half_buf = None
         self._update_normal_flat = None
         self._update_normal_smooth = None
         self._update_buffer_fn = None
@@ -258,6 +260,15 @@ class JITRenderer:
         self._mesh_textures = set()
         self._shadow_textures = set()
         self._context_revision = None
+        # With 'has_aux_targets', offscreen passes draw the image in half floats and the auxiliary colour targets of
+        # mesh.frag (AUX_TARGETS) beside it, and read them all back into 'aux_images' (see
+        # Renderer._read_main_framebuffer). Programs with and without them are compiled and kept apart. An
+        # 'aux_reader' takes the resolved renderbuffers instead, with the context current, and the pass reads back only
+        # the depth it is asked for: called with the renderbuffers of the image and of the auxiliary targets, the width
+        # and the height, it returns whether it took them.
+        self.has_aux_targets = False
+        self.aux_images = ()
+        self.aux_reader = None
         self.set_primitive(scene, node_list, primitive_list)
         self.set_light(scene, scene.light_nodes, scene.ambient_light)
         self.reflection_mat = np.identity(4, np.float32)
@@ -685,7 +696,8 @@ class JITRenderer:
             self.n_indices[inactive] = saved
 
     def load_programs(self, renderer, flags, program_flags):
-        if (flags, program_flags) not in self.program_id:
+        key = (flags, program_flags, self.has_aux_targets)
+        if key not in self.program_id:
             program_id = np.zeros_like(self.vao_id)
             for i, primitive in enumerate(self.primitive_list):
                 prim_flags = flags
@@ -695,11 +707,13 @@ class JITRenderer:
                     prim_flags &= ~(
                         RenderFlags.SHADOWS_DIRECTIONAL | RenderFlags.SHADOWS_SPOT | RenderFlags.SHADOWS_POINT
                     )
-                program = renderer._get_primitive_program(primitive, prim_flags, program_flags)
+                program = renderer._get_primitive_program(primitive, prim_flags, program_flags, self.has_aux_targets)
                 program_id[i] = program._program_id
-            self.program_id[(flags, program_flags)] = program_id
+            self.program_id[key] = program_id
 
     def gen_func_ptr(self):
+        # The passes, buffer uploads and readbacks call OpenGL alone, and release the GIL meanwhile: other threads run
+        # while the GPU draws or the CPU waits for its pixels.
         self.gl = GLWrapper()
 
         IS_OPENGL_42_AVAILABLE = hasattr(self.gl.wrapper_instance, "glDrawElementsInstancedBaseInstance")
@@ -739,6 +753,7 @@ class JITRenderer:
                 self.gl.wrapper_type,
             ),
             cache=True,
+            nogil=True,
         )
         def forward_pass(
             vao_id,
@@ -983,6 +998,7 @@ class JITRenderer:
                 self.gl.wrapper_type,
             ),
             cache=True,
+            nogil=True,
         )
         def shadow_mapping_pass(
             vao_id,
@@ -1120,6 +1136,7 @@ class JITRenderer:
                 self.gl.wrapper_type,
             ),
             cache=True,
+            nogil=True,
         )
         def point_shadow_mapping_pass(
             vao_id,
@@ -1237,7 +1254,9 @@ class JITRenderer:
             gl.glUseProgram(0)
             gl.glFlush()
 
-        @nb.jit(nb.float32[:, :](nb.int32, nb.int32, nb.float32, nb.float32, self.gl.wrapper_type), cache=True)
+        @nb.jit(
+            nb.float32[:, :](nb.int32, nb.int32, nb.float32, nb.float32, self.gl.wrapper_type), cache=True, nogil=True
+        )
         def read_depth_buf(width, height, z_near, z_far, gl):
             buf = np.zeros((height, width), np.float32)
             gl.glReadPixels(0, 0, width, height, GL_DEPTH_COMPONENT, GL_FLOAT, address_to_ptr(buf.ctypes.data))
@@ -1248,7 +1267,7 @@ class JITRenderer:
                 depth_im = (z_near * z_far) / (z_far + z_near - depth_im * (z_far - z_near)) * 2
             return depth_im
 
-        @nb.jit(nb.uint8[:, :, :](nb.int32, nb.int32, nb.int32, self.gl.wrapper_type), cache=True)
+        @nb.jit(nb.uint8[:, :, :](nb.int32, nb.int32, nb.int32, self.gl.wrapper_type), cache=True, nogil=True)
         def read_color_buf(width, height, rgba, gl):
             if rgba:
                 buf = np.zeros((height, width, 4), np.uint8)
@@ -1256,6 +1275,13 @@ class JITRenderer:
             else:
                 buf = np.zeros((height, width, 3), np.uint8)
                 gl.glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, address_to_ptr(buf.ctypes.data))
+            return buf[::-1, :, :]
+
+        # Half floats as their 16-bit words: numba has no float16 arrays.
+        @nb.jit(nb.uint16[:, :, :](nb.int32, nb.int32, self.gl.wrapper_type), cache=True, nogil=True)
+        def read_half_buf(width, height, gl):
+            buf = np.zeros((height, width, 4), np.uint16)
+            gl.glReadPixels(0, 0, width, height, GL_RGBA, GL_HALF_FLOAT, address_to_ptr(buf.ctypes.data))
             return buf[::-1, :, :]
 
         @nb.jit(nb.float32[:, :](nb.float32[:, :, :]), cache=True)
@@ -1282,7 +1308,7 @@ class JITRenderer:
                 vertex_normal[v] /= np.linalg.norm(vertex_normal[v])
             return vertex_normal
 
-        @nb.jit(nb.none(nb.int64[:, :], self.gl.wrapper_type), cache=True)
+        @nb.jit(nb.none(nb.int64[:, :], self.gl.wrapper_type), cache=True, nogil=True)
         def update_buffer(updates, gl):
             for i in range(updates.shape[0]):
                 buffer_id = updates[i, 0]
@@ -1301,6 +1327,7 @@ class JITRenderer:
         self._point_shadow_mapping_pass = point_shadow_mapping_pass
         self._read_depth_buf = read_depth_buf
         self._read_color_buf = read_color_buf
+        self._read_half_buf = read_half_buf
         self._update_normal_flat = update_normal_flat
         self._update_normal_smooth = update_normal_smooth
         self._update_buffer_fn = update_buffer
@@ -1352,7 +1379,7 @@ class JITRenderer:
         with self._env_filtered_culling(env_idx):
             self._forward_pass(
                 self.vao_id,
-                self.program_id[(flags, program_flags)],
+                self.program_id[(flags, program_flags, self.has_aux_targets)],
                 self.pose,
                 self.textures,
                 self.pbr_mat,
@@ -1395,7 +1422,7 @@ class JITRenderer:
         with self._env_filtered_culling(env_idx):
             self._shadow_mapping_pass(
                 self.vao_id,
-                self.program_id[(flags, program_flags)],
+                self.program_id[(flags, program_flags, self.has_aux_targets)],
                 self.pose,
                 self.mode,
                 self.n_instances,
@@ -1420,7 +1447,7 @@ class JITRenderer:
         with self._env_filtered_culling(env_idx):
             self._point_shadow_mapping_pass(
                 self.vao_id,
-                self.program_id[(flags, program_flags)],
+                self.program_id[(flags, program_flags, self.has_aux_targets)],
                 self.pose,
                 self.mode,
                 self.n_instances,
@@ -1457,20 +1484,25 @@ class JITRenderer:
 
         The GL buffer id is resolved at flush time rather than here: a primitive is only added to the GL context
         during its first render pass, so an id resolved at enqueue time would be -1 for any update queued before
-        that pass and the update would be silently dropped.
+        that pass and the update would be silently dropped. The "element" buffer takes the primitive's new indices,
+        which the caller also sets on the primitive, and the pass draws as many indices as they hold.
         """
         if node.mesh is None or len(node.mesh.primitives) != 1:
             raise ValueError("Node must have one primitive")
         primitive = node.mesh.primitives[0]
         self._buffer[(primitive, buffer_name)] = data
+        i = self._primitive_index.get(primitive)
+        if i is not None and buffer_name == "element":
+            self.n_indices[i] = data.size
         # New vertex positions move the bounds of the bare geometry along, and new instance transforms (uploaded
         # transposed, translation in the last row) the range the instances span. A placed primitive gets that from
         # its poses in bulk instead (see '_update_instances').
-        i = self._primitive_index.get(primitive)
         if i is not None and len(data):
             if buffer_name == "pos":
-                self.bounds_geom[i, 0] = data.min(axis=0)
-                self.bounds_geom[i, 1] = data.max(axis=0)
+                # Reductions along the contiguous axis vectorize, unlike those across the rows of an (n, 3) array.
+                coordinates = data.T.copy()
+                self.bounds_geom[i, 0] = coordinates.min(axis=1)
+                self.bounds_geom[i, 1] = coordinates.max(axis=1)
             elif buffer_name == "model" and not self.is_instance_placed[i]:
                 self._set_translation_bounds(np.array([i]), data[np.newaxis, :, 3, :3])
         self._scene.bump_revision()
@@ -1483,7 +1515,8 @@ class JITRenderer:
         updates = np.zeros((len(self._buffer), 3), dtype=np.int64)
         buffers = []
         for idx, ((primitive, buffer_name), data) in enumerate(self._buffer.items()):
-            buffer = np.ascontiguousarray(data, dtype=np.float32)
+            # Indices and attributes both take 4 bytes per value.
+            buffer = np.ascontiguousarray(data, dtype=np.uint32 if buffer_name == "element" else np.float32)
             buffers.append(buffer)
 
             # Still -1 if the primitive was removed from the scene since the update was queued. The upload kernel
@@ -1501,6 +1534,12 @@ class JITRenderer:
         if self._read_depth_buf is None:
             self.gen_func_ptr()
         return self._read_depth_buf(weight, height, z_near, z_far, self.gl.wrapper_instance)
+
+    def read_half_buf(self, width, height):
+        """Return the RGBA colour of the bound read buffer as half floats, top row first."""
+        if self._read_half_buf is None:
+            self.gen_func_ptr()
+        return self._read_half_buf(width, height, self.gl.wrapper_instance).view(np.float16)
 
     def read_color_buf(self, weight, height, rgba):
         if self._read_color_buf is None:

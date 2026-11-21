@@ -57,6 +57,11 @@ uniform float env_offset_scale;
     #ifdef COLOR_0_LOC
     out vec4 v_color_multiplier;
     #endif
+    #ifdef REST_SPACE
+    out vec3 v_rest_position;
+    out vec3 v_rest_normal;
+    out float v_hex_density;
+    #endif
 #else
     out vec3 frag_position;
     #ifdef NORMAL_LOC
@@ -76,7 +81,17 @@ uniform float env_offset_scale;
     out vec2 uv_1;
     #endif
     #ifdef COLOR_0_LOC
+    // Sampled inside the triangle, as mesh.frag explains.
+    #ifdef AUX_TARGETS
+    centroid out vec4 color_multiplier;
+    #else
     out vec4 color_multiplier;
+    #endif
+    #endif
+    #ifdef REST_SPACE
+    out vec3 rest_position;
+    out vec3 rest_normal;
+    out float hex_density;
     #endif
 #endif
 
@@ -115,6 +130,13 @@ void main()
     #ifdef COLOR_0_LOC
         v_color_multiplier = color_0;
     #endif
+    #ifdef REST_SPACE
+        // The rest position in repeats of the material's maps, the rest normal and the density of the hexagons that
+        // tile the maps (mesh.frag, REST_SPACE).
+        v_rest_position = vec3(texcoord_0, texcoord_1.x);
+        v_rest_normal = tangent.xyz;
+        v_hex_density = texcoord_1.y;
+    #endif
 #else
     frag_position = world_position.xyz;
 
@@ -142,6 +164,11 @@ void main()
     #endif
     #ifdef COLOR_0_LOC
         color_multiplier = color_0;
+    #endif
+    #ifdef REST_SPACE
+        rest_position = vec3(texcoord_0, texcoord_1.x);
+        rest_normal = tangent.xyz;
+        hex_density = texcoord_1.y;
     #endif
 #endif
 }

@@ -26,7 +26,20 @@ out vec2 uv_1;
 #endif
 #ifdef COLOR_0_LOC
 in vec4 v_color_multiplier[];
+// Sampled inside the triangle, as mesh.frag explains.
+#ifdef AUX_TARGETS
+centroid out vec4 color_multiplier;
+#else
 out vec4 color_multiplier;
+#endif
+#endif
+#ifdef REST_SPACE
+in vec3 v_rest_position[];
+in vec3 v_rest_normal[];
+in float v_hex_density[];
+out vec3 rest_position;
+out vec3 rest_normal;
+out float hex_density;
 #endif
 
 void emit_vertex(int i, bool reversed) {
@@ -64,6 +77,13 @@ void emit_vertex(int i, bool reversed) {
 
 #ifdef COLOR_0_LOC
     color_multiplier = v_color_multiplier[i];
+#endif
+
+#ifdef REST_SPACE
+    // The material keeps its side in rest space: the back face flips only the normal it is lit by.
+    rest_position = v_rest_position[i];
+    rest_normal = v_rest_normal[i];
+    hex_density = v_hex_density[i];
 #endif
 
     EmitVertex();

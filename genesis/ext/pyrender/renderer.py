@@ -33,6 +33,11 @@ from .texture import Texture
 
 MARKER_XRAY_DIM_FACTOR = 0.3
 MARKER_XRAY_ALPHA = 0.4
+# Framebuffer attachments of the auxiliary colour targets of mesh.frag (AUX_TARGETS), in the order of its outputs, and
+# their storage: the specular light in half floats, the normal and the albedo in bytes. The image itself takes half
+# floats beside them.
+AUX_ATTACHMENTS = (GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT3)
+AUX_FORMATS = (GL_RGBA16F, GL_RGBA, GL_RGBA)
 
 
 class Renderer(object):
@@ -71,6 +76,8 @@ class Renderer(object):
         self._main_fb_ms = None
         self._main_cb_ms = None
         self._main_db_ms = None
+        self._main_aux_cb = None
+        self._main_aux_cb_ms = None
         self._main_fb_dims = (None, None)
         self._shadow_fb = None
         self._floor_fb = None
@@ -379,6 +386,11 @@ class Renderer(object):
             glClearColor(*scene.bg_color)
 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        # The auxiliary targets start empty, whatever the background colour: their zero stands for no material.
+        is_shaded = not flags & (RenderFlags.SEG | RenderFlags.DEPTH_ONLY)
+        if self.jit.has_aux_targets and flags & RenderFlags.OFFSCREEN and is_shaded:
+            for index in range(1, 1 + len(AUX_ATTACHMENTS)):
+                glClearBufferfv(GL_COLOR, index, (0.0, 0.0, 0.0, 0.0))
 
         if flags & RenderFlags.SEG or flags & RenderFlags.DEPTH_ONLY:
             glDisable(GL_MULTISAMPLE)
@@ -746,7 +758,7 @@ class Renderer(object):
 
         return max_n_lights
 
-    def _get_primitive_program(self, primitive, flags, program_flags):
+    def _get_primitive_program(self, primitive, flags, program_flags, has_aux_targets=False):
         vertex_shader = None
         fragment_shader = None
         geometry_shader = None
@@ -855,6 +867,20 @@ class Renderer(object):
                 defines["USE_METALLIC_MATERIAL"] = 1
             elif isinstance(primitive.material, SpecularGlossinessMaterial):
                 defines["USE_GLOSSY_MATERIAL"] = 1
+        if has_aux_targets:
+            defines["AUX_TARGETS"] = 1
+            # Under the endoscope camera's targets, a textured material on a mesh with a second set of texture
+            # coordinates and tangents takes its maps in rest space: the mesh carries each vertex's rest position in
+            # the first two sets and its rest normal in the tangent (mesh.frag, REST_SPACE).
+            tf = primitive.material.tex_flags if program_flags & ProgramFlags.USE_MATERIAL else TexFlags.NONE
+            if (
+                bf & BufFlags.TEXCOORD_1
+                and bf & BufFlags.TANGENT
+                and bf & BufFlags.NORMAL
+                and tf & TexFlags.BASE_COLOR
+                and tf & TexFlags.NORMAL
+            ):
+                defines["REST_SPACE"] = 1
 
         program = self._program_cache.get_program(
             vertex_shader=vertex_shader,
@@ -979,6 +1005,7 @@ class Renderer(object):
             self._main_fb is not None
             and self.viewport_width != self._main_fb_dims[0]
             or self.viewport_height != self._main_fb_dims[1]
+            or (self._main_aux_cb is not None) != self.jit.has_aux_targets
         ):
             self._delete_main_framebuffer()
 
@@ -988,7 +1015,8 @@ class Renderer(object):
             self._main_cb, self._main_db = glGenRenderbuffers(2)
 
             glBindRenderbuffer(GL_RENDERBUFFER, self._main_cb)
-            glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA, self.viewport_width, self.viewport_height)
+            color_storage = GL_RGBA16F if self.jit.has_aux_targets else GL_RGBA
+            glRenderbufferStorage(GL_RENDERBUFFER, color_storage, self.viewport_width, self.viewport_height)
 
             glBindRenderbuffer(GL_RENDERBUFFER, self._main_db)
             glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, self.viewport_width, self.viewport_height)
@@ -1003,7 +1031,7 @@ class Renderer(object):
             self._main_cb_ms, self._main_db_ms = glGenRenderbuffers(2)
             glBindRenderbuffer(GL_RENDERBUFFER, self._main_cb_ms)
             glRenderbufferStorageMultisample(
-                GL_RENDERBUFFER, num_samples, GL_RGBA, self.viewport_width, self.viewport_height
+                GL_RENDERBUFFER, num_samples, color_storage, self.viewport_width, self.viewport_height
             )
             glBindRenderbuffer(GL_RENDERBUFFER, self._main_db_ms)
             glRenderbufferStorageMultisample(
@@ -1014,6 +1042,25 @@ class Renderer(object):
             glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, self._main_cb_ms)
             glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, self._main_db_ms)
 
+            # The auxiliary colour targets (see JITRenderer.has_aux_targets), drawn beside the image by the
+            # multisampled framebuffer and resolved into the standard one.
+            if self.jit.has_aux_targets:
+                count = len(AUX_ATTACHMENTS)
+                self._main_aux_cb, self._main_aux_cb_ms = glGenRenderbuffers(count), glGenRenderbuffers(count)
+                for attachment, storage, cb, cb_ms in zip(AUX_ATTACHMENTS, AUX_FORMATS, self._main_aux_cb,
+                                                          self._main_aux_cb_ms):
+                    glBindRenderbuffer(GL_RENDERBUFFER, cb)
+                    glRenderbufferStorage(GL_RENDERBUFFER, storage, self.viewport_width, self.viewport_height)
+                    glBindRenderbuffer(GL_RENDERBUFFER, cb_ms)
+                    glRenderbufferStorageMultisample(
+                        GL_RENDERBUFFER, num_samples, storage, self.viewport_width, self.viewport_height
+                    )
+                    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, self._main_fb)
+                    glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, attachment, GL_RENDERBUFFER, cb)
+                    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, self._main_fb_ms)
+                    glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, attachment, GL_RENDERBUFFER, cb_ms)
+                glDrawBuffers(1 + len(AUX_ATTACHMENTS), [GL_COLOR_ATTACHMENT0, *AUX_ATTACHMENTS])
+
             self._main_fb_dims = (self.viewport_width, self.viewport_height)
 
     def _delete_main_framebuffer(self):
@@ -1023,6 +1070,8 @@ class Renderer(object):
             glDeleteRenderbuffers(2, [self._main_cb, self._main_cb_ms])
         if self._main_db is not None:
             glDeleteRenderbuffers(2, [self._main_db, self._main_db_ms])
+        if self._main_aux_cb is not None:
+            glDeleteRenderbuffers(2 * len(AUX_ATTACHMENTS), [*self._main_aux_cb, *self._main_aux_cb_ms])
 
         self._main_fb = None
         self._main_cb = None
@@ -1030,6 +1079,8 @@ class Renderer(object):
         self._main_fb_ms = None
         self._main_cb_ms = None
         self._main_db_ms = None
+        self._main_aux_cb = None
+        self._main_aux_cb_ms = None
         self._main_fb_dims = (None, None)
 
     def _read_main_framebuffer(self, scene, flags):
@@ -1057,6 +1108,37 @@ class Renderer(object):
 
         if flags & RenderFlags.DEPTH_ONLY:
             return (depth_im,)
+
+        # Resolve the auxiliary targets like the image, then restore the colour as the read buffer of both framebuffers
+        # and the draw buffer of the standard one. The aux reader takes the resolved renderbuffers as they are, or the
+        # image, in half floats, and the auxiliary targets are read back.
+        has_aux = self.jit.has_aux_targets and not flags & RenderFlags.SEG
+        if has_aux:
+            for attachment in AUX_ATTACHMENTS:
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, self._main_fb_ms)
+                glReadBuffer(attachment)
+                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, self._main_fb)
+                glDrawBuffer(attachment)
+                glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_LINEAR)
+            glDrawBuffer(GL_COLOR_ATTACHMENT0)
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, self._main_fb)
+            reader = self.jit.aux_reader
+            if reader is not None and reader((self._main_cb, *self._main_aux_cb), width, height):
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, self._main_fb_ms)
+                glReadBuffer(GL_COLOR_ATTACHMENT0)
+                return (None, depth_im) if flags & RenderFlags.RET_DEPTH else (None,)
+            aux_images = []
+            for attachment, storage in zip((GL_COLOR_ATTACHMENT0, *AUX_ATTACHMENTS), (GL_RGBA16F, *AUX_FORMATS)):
+                glReadBuffer(attachment)
+                if storage == GL_RGBA16F:
+                    aux_images.append(self.jit.read_half_buf(width, height))
+                else:
+                    aux_images.append(self.jit.read_color_buf(width, height, False))
+            glReadBuffer(GL_COLOR_ATTACHMENT0)
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, self._main_fb_ms)
+            glReadBuffer(GL_COLOR_ATTACHMENT0)
+            self.jit.aux_images = tuple(aux_images)
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, self._main_fb)
 
         # Read color
         color_im = self.jit.read_color_buf(width, height, flags & RenderFlags.RGBA)
