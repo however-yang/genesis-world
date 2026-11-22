@@ -591,11 +591,10 @@ class JITRenderer:
                 len(primitive.poses) == 1 or primitive.is_env_instanced
             )
             # A primitive without a single vertex keeps the zero centre and bounds it was allocated with, rather than
-            # reducing over an empty axis
-            positions = primitive.positions
-            if len(positions):
-                self.bounds_geom[i, 0] = positions.min(axis=0)
-                self.bounds_geom[i, 1] = positions.max(axis=0)
+            # reducing over an empty axis. Every primitive is set again whenever a node comes or goes, so the bounds
+            # kept with the geometry spare reducing the vertices of every large static mesh each time.
+            if len(primitive.positions):
+                self.bounds_geom[i] = primitive.geometry_bounds
                 self.centroid_geom[i] = 0.5 * (self.bounds_geom[i, 0] + self.bounds_geom[i, 1])
             self.is_floor[i] = primitive.is_floor
             self.is_env_instanced[i] = primitive.is_env_instanced

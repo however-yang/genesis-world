@@ -23,6 +23,28 @@ def _compute_bounds(positions):
     return bounds
 
 
+@nb.jit(nopython=True, cache=True)
+def _accumulate_vertex_normals(positions, faces, vertex_normal):
+    """Add the normal of each face, the cross product of its edges from its first corner, to its three corners, face
+    after face."""
+    for i_f in range(len(faces)):
+        i_a, i_b, i_c = faces[i_f, 0], faces[i_f, 1], faces[i_f, 2]
+        u0 = positions[i_b, 0] - positions[i_a, 0]
+        u1 = positions[i_b, 1] - positions[i_a, 1]
+        u2 = positions[i_b, 2] - positions[i_a, 2]
+        v0 = positions[i_c, 0] - positions[i_a, 0]
+        v1 = positions[i_c, 1] - positions[i_a, 1]
+        v2 = positions[i_c, 2] - positions[i_a, 2]
+        n0 = u1 * v2 - u2 * v1
+        n1 = u2 * v0 - u0 * v2
+        n2 = u0 * v1 - u1 * v0
+        for k in range(3):
+            i_v = faces[i_f, k]
+            vertex_normal[i_v, 0] += n0
+            vertex_normal[i_v, 1] += n1
+            vertex_normal[i_v, 2] += n2
+
+
 class Primitive(object):
     """A primitive object which can be rendered.
 
@@ -283,20 +305,25 @@ class Primitive(object):
         self._bounds = None
 
     @property
+    def geometry_bounds(self):
+        """Bounds of the vertex positions, without the instance transforms, kept until the positions change."""
+        if self._bounds_0 is None:
+            self._bounds_0 = _compute_bounds(self.positions)
+        return self._bounds_0
+
+    @property
     def bounds(self):
         """Compute the bounds of this object."""
         if self._bounds is None:
-            if self._bounds_0 is None:
-                self._bounds_0 = _compute_bounds(self.positions)
             if self.poses is not None:
                 if len(self.poses) == 1:
-                    self._bounds = self._bounds_0 + self.poses[:, :3, 3]
+                    self._bounds = self.geometry_bounds + self.poses[:, :3, 3]
                 else:
-                    self._bounds = self._bounds_0 + np.stack(
+                    self._bounds = self.geometry_bounds + np.stack(
                         (np.min(self.poses[:, :3, 3], axis=0), np.max(self.poses[:, :3, 3], axis=0)), axis=0
                     )
             else:
-                self._bounds = self._bounds_0
+                self._bounds = self.geometry_bounds
         return self._bounds
 
     @property
@@ -345,13 +372,11 @@ class Primitive(object):
             vertex_normal = np.repeat(face_normal, 3, axis=0)
         else:
             p = self.positions.reshape((-1, 3))
-            idx = self.indices.reshape((-1, 3))
-            face_points = p[idx]
-            face_normal = np.cross(face_points[:, 1] - face_points[:, 0], face_points[:, 2] - face_points[:, 0])
-            # Must use `np.add.at` which is unbuffered unlike `+=`, otherwise accumulation will
-            # not work properly as there are repeated indices.
+            # The face normals are summed per vertex in face order, as an unbuffered accumulation over repeated indices
+            # must be. A compiled loop does it without the temporaries of 'np.add.at', which stalled the first draw of
+            # every new large primitive.
             vertex_normal = np.zeros_like(p)
-            np.add.at(vertex_normal, idx.reshape((-1,)), np.repeat(face_normal, 3, axis=0))
+            _accumulate_vertex_normals(p, self.indices.reshape((-1, 3)), vertex_normal)
             vertex_normal /= np.maximum(1e-10, np.linalg.norm(vertex_normal, axis=1, keepdims=True))
         return vertex_normal
 
