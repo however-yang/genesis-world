@@ -810,6 +810,11 @@ class Renderer(object):
         if bf & BufFlags.TANGENT:
             defines["TANGENT_LOC"] = buf_idx
             buf_idx += 1
+            # A mesh with tangents and normals gives mesh.frag its tangent frame (HAS_TANGENTS): the frame rebuilt there
+            # from the screen-space derivatives of the texture coordinates degenerates where these barely change across
+            # a face, and flickers from frame to frame.
+            if bf & BufFlags.NORMAL:
+                defines["HAS_TANGENTS"] = 1
         if bf & BufFlags.TEXCOORD_0:
             defines["TEXCOORD_0_LOC"] = buf_idx
             buf_idx += 1
