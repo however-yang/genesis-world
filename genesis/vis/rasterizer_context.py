@@ -448,6 +448,16 @@ class RasterizerContext:
     def set_node_pose(self, node, pose):
         self._scene.set_pose(node, pose)
 
+    def set_node_visible(self, node, is_visible):
+        """Show or hide a node's mesh. The draw list is rebuilt when a mesh node comes or goes, so the node leaves the
+        scene and comes back with its mesh's visibility changed (keeping its pose); a caller that draws from another
+        thread holds the viewer's lock around it."""
+        if node.mesh.is_visible == is_visible:
+            return
+        self._scene.remove_node(node)
+        node.mesh.is_visible = is_visible
+        self._scene.add_node(node)
+
     def update_camera_frustum(self, camera):
         if self.camera_frustum_shown:
             self.set_node_pose(self.frustum_nodes[camera.uid], camera.transform)
