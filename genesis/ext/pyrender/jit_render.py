@@ -269,6 +269,11 @@ class JITRenderer:
         self.has_aux_targets = False
         self.aux_images = ()
         self.aux_reader = None
+        # Values of float uniforms of the programs by name (the tissue shader's constants in mesh.frag, which default to
+        # their declared values): each program takes them once it is linked and again when they change. None leaves
+        # the shaders' defaults.
+        self.shader_constants = None
+        self._applied_constants = {}
         self.set_primitive(scene, node_list, primitive_list)
         self.set_light(scene, scene.light_nodes, scene.ambient_light)
         self.reflection_mat = np.identity(4, np.float32)
@@ -709,6 +714,26 @@ class JITRenderer:
                 program = renderer._get_primitive_program(primitive, prim_flags, program_flags, self.has_aux_targets)
                 program_id[i] = program._program_id
             self.program_id[key] = program_id
+        if self.shader_constants:
+            values = tuple(sorted(self.shader_constants.items()))
+            if self._applied_constants.get(key) != values:
+                self.apply_constants(self.program_id[key], values)
+                self._applied_constants[key] = values
+
+    @staticmethod
+    def apply_constants(program_ids, values):
+        """Set the float uniforms `values` ((name, value) pairs) in each of the programs that has them; the program in
+        use stays."""
+        from OpenGL import GL
+
+        current = GL.glGetIntegerv(GL.GL_CURRENT_PROGRAM)
+        for pid in sorted(set(int(p) for p in program_ids)):
+            GL.glUseProgram(pid)
+            for name, value in values:
+                location = GL.glGetUniformLocation(pid, name)
+                if location >= 0:
+                    GL.glUniform1f(location, float(value))
+        GL.glUseProgram(int(current))
 
     def gen_func_ptr(self):
         # The passes, buffer uploads and readbacks call OpenGL alone, and release the GIL meanwhile: other threads run

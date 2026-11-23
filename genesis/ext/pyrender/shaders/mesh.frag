@@ -173,14 +173,14 @@ layout(location = 3) out vec4 albedo_color;
 float pooled_share = 0.5;
 // Roughness of the pooled film's surface, a free surface of water: optically smooth, its lobe set by the lamp's size
 // and by the film's undulations over the pixel.
-const float pooled_film_roughness = 0.035;
+uniform float pooled_film_roughness = 0.035;
 // The lamp is the exit of the light guide around the endoscope's lens, the annulus of fibres of a 10 mm laparoscope
 // between these radii in metres, of uniform radiance. A smooth film mirrors it as it is, so that the glints of wet
 // tissue are the islands of the film whose normals send the camera's view into the annulus: the film's undulations
 // over a few tenths of a millimetre to a few millimetres break them into the irregular flakes of laparoscopic images,
 // where a point lamp would leave dots.
-const float lamp_inner_radius = 0.003;
-const float lamp_outer_radius = 0.0045;
+uniform float lamp_inner_radius = 0.003;
+uniform float lamp_outer_radius = 0.0045;
 // The distance of the fragment from the point light being shaded, set per light: its annulus subtends the angles of
 // its radii over it. A light other than a point light shades as a point.
 float lamp_distance = 1e9;
@@ -191,7 +191,7 @@ float pixel_alpha2 = 0.0;
 // The surface of the film of fluid, which surface tension smooths over the tissue's finest relief: the normal map read
 // film_mip_bias mip levels coarser, about a third of a millimetre at the demonstration's working distance, and the
 // squared spread of its normal over the pixel.
-const float film_mip_bias = 2.0;
+uniform float film_mip_bias = 2.0;
 vec3 film_normal = vec3(0.0, 0.0, 1.0);
 float film_alpha2 = 0.0;
 #else
@@ -358,9 +358,9 @@ vec3 mirrored_lamp(vec3 normal, vec3 v, vec3 l, vec3 radiance, float alpha2)
 // hexagons of each projection that carries weight. The blend weights come from the albedo and are shared by the other
 // maps. The hexagons draw their random numbers from cell_random, which the camera's targets define. Every map is read
 // and blended in one pass over the samples, whose values stay in registers.
-const float hex_sharpness = 7.0;
-const float hex_luminance_contrast = 0.6;
-const float projection_cutoff = 0.06;
+uniform float hex_sharpness = 7.0;
+uniform float hex_luminance_contrast = 0.6;
+uniform float projection_cutoff = 0.06;
 // The fragment's maps blended in rest space (rest_space_maps): the albedo, the metallic-roughness map, the shading
 // normal and the coarser normal of the film of fluid.
 vec4 rest_albedo = vec4(0.0);
@@ -482,7 +482,10 @@ void rest_space_maps()
             luminance[i] = dot(albedos[i].rgb, vec3(0.299, 0.587, 0.114));
         }
         if (hex_density > 0.0) {
-            tile_weights *= mix(vec3(1.0), luminance, hex_luminance_contrast);
+            // The default as a literal: the compiler folds its arithmetic, which a run-time value cannot repeat to
+            // the last bit (one level on a few pixels); any other value takes the uniform.
+            tile_weights *= hex_luminance_contrast == 0.6 ? mix(vec3(1.0), luminance, 0.6)
+                                                          : mix(vec3(1.0), luminance, hex_luminance_contrast);
         }
         tile_weights /= max(tile_weights.x + tile_weights.y + tile_weights.z, 1e-9);
         for (int i = 0; i < 3; i++) {
